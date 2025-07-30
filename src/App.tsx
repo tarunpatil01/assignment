@@ -43,7 +43,7 @@ function App() {
   const [rowsPerPage] = useState(12);
   const [selectedArtworks, setSelectedArtworks] = useState<Set<number>>(new Set());
   const [showSelectionWindow, setShowSelectionWindow] = useState(false);
-  const [selectionSearchText, setSelectionSearchText] = useState('');
+  const [selectionCount, setSelectionCount] = useState('');
   const toast = useRef<Toast>(null);
 
   // Close selection window when clicking outside
@@ -105,60 +105,96 @@ function App() {
     console.log('Selection updated:', selected.size, 'of', allIds.size, 'items selected');
   };
 
-  // Search functionality
-  const handleSearch = () => {
-    if (!selectionSearchText.trim()) {
+  // Select N rows functionality
+  const handleSelectNRows = async () => {
+    const count = parseInt(selectionCount.trim());
+    
+    if (!selectionCount.trim() || isNaN(count) || count <= 0) {
       toast.current?.show({
         severity: 'warn',
         summary: 'Warning',
-        detail: 'Please enter search text',
+        detail: 'Please enter a valid number of rows to select',
         life: 3000
       });
       return;
     }
 
-    const searchTerm = selectionSearchText.toLowerCase().trim();
-    const matchingIds: number[] = [];
-
-    artworks.forEach(artwork => {
-      const title = artwork.title?.toLowerCase() || '';
-      const artist = artwork.artist_display?.toLowerCase() || '';
-      const origin = artwork.place_of_origin?.toLowerCase() || '';
-      const inscriptions = artwork.inscriptions?.toLowerCase() || '';
-
-      if (title.includes(searchTerm) || 
-          artist.includes(searchTerm) || 
-          origin.includes(searchTerm) || 
-          inscriptions.includes(searchTerm)) {
-        matchingIds.push(artwork.id);
-      }
-    });
-
-    if (matchingIds.length === 0) {
+    if (count <= selectedArtworks.size) {
       toast.current?.show({
         severity: 'info',
-        summary: 'No Results',
-        detail: 'No artworks found matching your search',
+        summary: 'Info',
+        detail: `Already have ${selectedArtworks.size} items selected. Please enter a larger number.`,
         life: 3000
       });
       return;
     }
 
-    // Add matching results to selection
+    setLoading(true);
     const newSelected = new Set(selectedArtworks);
-    matchingIds.forEach(id => newSelected.add(id));
-    setSelectedArtworks(newSelected);
-    updateSelectAll(newSelected);
+    let remainingToSelect = count - selectedArtworks.size;
+    let currentPageToFetch = currentPage;
 
-    toast.current?.show({
-      severity: 'success',
-      summary: 'Search Complete',
-      detail: `${matchingIds.length} artworks selected based on search`,
-      life: 3000
-    });
+    try {
+      // First, select all items on current page that aren't already selected
+      artworks.forEach(artwork => {
+        if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+          newSelected.add(artwork.id);
+          remainingToSelect--;
+        }
+      });
 
-    setShowSelectionWindow(false);
-    setSelectionSearchText('');
+      // If we need more items, fetch subsequent pages
+      while (remainingToSelect > 0) {
+        currentPageToFetch++;
+        
+        // Check if we've reached the end of available pages
+        const maxPages = Math.ceil(totalRecords / rowsPerPage);
+        if (currentPageToFetch > maxPages) {
+          toast.current?.show({
+            severity: 'warn',
+            summary: 'Warning',
+            detail: `Only ${newSelected.size} items available. Cannot select ${count} items.`,
+            life: 3000
+          });
+          break;
+        }
+
+        // Fetch next page
+        const response = await fetch(`https://api.artic.edu/api/v1/artworks?page=${currentPageToFetch}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`);
+        const data: ApiResponse = await response.json();
+        
+        // Select items from this page
+        data.data.forEach(artwork => {
+          if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+            newSelected.add(artwork.id);
+            remainingToSelect--;
+          }
+        });
+      }
+
+      setSelectedArtworks(newSelected);
+      updateSelectAll(newSelected);
+
+      toast.current?.show({
+        severity: 'success',
+        summary: 'Selection Complete',
+        detail: `${newSelected.size} artworks selected`,
+        life: 3000
+      });
+
+      setShowSelectionWindow(false);
+      setSelectionCount('');
+    } catch (error) {
+      console.error('Error selecting rows:', error);
+      toast.current?.show({
+        severity: 'error',
+        summary: 'Error',
+        detail: 'Failed to select rows',
+        life: 3000
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
 
@@ -241,25 +277,33 @@ function App() {
           {showSelectionWindow && (
             <div className="absolute top-0 left-0 z-20 bg-white border border-gray-300 rounded-md shadow-lg p-3 min-w-64 selection-window">
               <div className="mb-3">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Number of rows to select:
+                </label>
                 <input
-                  type="text"
-                  placeholder="Select rows..."
-                  value={selectionSearchText}
-                  onChange={(e) => setSelectionSearchText(e.target.value)}
+                  type="number"
+                  placeholder="Enter number (e.g., 20)"
+                  value={selectionCount}
+                  onChange={(e) => setSelectionCount(e.target.value)}
                   onKeyPress={(e) => {
                     if (e.key === 'Enter') {
-                      handleSearch();
+                      handleSelectNRows();
                     }
                   }}
                   className="w-full p-2 border border-gray-300 rounded-md text-sm"
+                  min="1"
                 />
+                <p className="text-xs text-gray-500 mt-1">
+                  Currently selected: {selectedArtworks.size} items
+                </p>
               </div>
               <div className="flex justify-center">
                 <Button
-                  label="Submit"
+                  label="Select Rows"
                   size="small"
-                  onClick={handleSearch}
+                  onClick={handleSelectNRows}
                   className="px-4 py-1"
+                  disabled={loading}
                 />
               </div>
             </div>
