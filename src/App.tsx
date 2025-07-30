@@ -272,12 +272,26 @@ function App() {
             showGridlines
             className="border-round"
             emptyMessage="No artworks found"
-            selection={Array.from(selectedArtworks).map(id => artworks.find(artwork => artwork.id === id)).filter(Boolean)}
+            selectionMode="multiple"
+            selection={artworks.filter(artwork => selectedArtworks.has(artwork.id))}
             onSelectionChange={(e) => {
               console.log('Selection changed:', e.value);
-              const newSelected = new Set(e.value.map((artwork: Artwork) => artwork.id));
-              setSelectedArtworks(newSelected as Set<number>);
-              updateSelectAll(newSelected as Set<number>);
+              const newSelected = new Set(selectedArtworks);
+              
+              // Add newly selected items
+              (e.value as Artwork[]).forEach((artwork: Artwork) => {
+                newSelected.add(artwork.id);
+              });
+              
+              // Remove deselected items from current page
+              artworks.forEach((artwork: Artwork) => {
+                if (!(e.value as Artwork[]).some((selected: Artwork) => selected.id === artwork.id)) {
+                  newSelected.delete(artwork.id);
+                }
+              });
+              
+              setSelectedArtworks(newSelected);
+              updateSelectAll(newSelected);
             }}
             dataKey="id"
           >
