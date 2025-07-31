@@ -4,6 +4,7 @@ import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Paginator } from 'primereact/paginator';
 import { ProgressSpinner } from 'primereact/progressspinner';
+import { ProgressBar } from 'primereact/progressbar';
 import { Button } from 'primereact/button';
 import { Card } from 'primereact/card';
 import { Toast } from 'primereact/toast';
@@ -44,6 +45,8 @@ function App() {
   const [selectedArtworks, setSelectedArtworks] = useState<Set<number>>(new Set());
   const [showSelectionWindow, setShowSelectionWindow] = useState(false);
   const [selectionCount, setSelectionCount] = useState('');
+  const [selectionProgress, setSelectionProgress] = useState(0);
+  const [isBulkSelecting, setIsBulkSelecting] = useState(false);
   const toast = useRef<Toast>(null);
 
   // Close selection window when clicking outside
@@ -105,7 +108,7 @@ function App() {
     console.log('Selection updated:', selected.size, 'of', allIds.size, 'items selected');
   };
 
-  // Select N rows functionality
+  // Optimized bulk selection with progress tracking
   const handleSelectNRows = async () => {
     const count = parseInt(selectionCount.trim());
     
@@ -129,10 +132,29 @@ function App() {
       return;
     }
 
+    // Calculate how many pages we need to fetch
+    const maxPages = Math.ceil(totalRecords / rowsPerPage);
+    const pagesNeeded = Math.ceil((count - selectedArtworks.size) / rowsPerPage);
+    const startPage = currentPage;
+    const endPage = Math.min(startPage + pagesNeeded, maxPages);
+
+    if (endPage > maxPages) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'Warning',
+        detail: `Only ${totalRecords} items available. Cannot select ${count} items.`,
+        life: 3000
+      });
+      return;
+    }
+
     setLoading(true);
+    setIsBulkSelecting(true);
+    setSelectionProgress(0);
     const newSelected = new Set(selectedArtworks);
     let remainingToSelect = count - selectedArtworks.size;
-    let currentPageToFetch = currentPage;
+    let processedPages = 0;
+    const totalPagesToProcess = endPage - startPage + 1;
 
     try {
       // First, select all items on current page that aren't already selected
@@ -142,43 +164,75 @@ function App() {
           remainingToSelect--;
         }
       });
+      processedPages++;
 
-      // If we need more items, fetch subsequent pages
-      while (remainingToSelect > 0) {
-        currentPageToFetch++;
-        
-        // Check if we've reached the end of available pages
-        const maxPages = Math.ceil(totalRecords / rowsPerPage);
-        if (currentPageToFetch > maxPages) {
-          toast.current?.show({
-            severity: 'warn',
-            summary: 'Warning',
-            detail: `Only ${newSelected.size} items available. Cannot select ${count} items.`,
-            life: 3000
-          });
-          break;
-        }
-
-        // Fetch next page
-        const response = await fetch(`https://api.artic.edu/api/v1/artworks?page=${currentPageToFetch}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`);
-        const data: ApiResponse = await response.json();
-        
-        // Select items from this page
-        data.data.forEach(artwork => {
-          if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
-            newSelected.add(artwork.id);
-            remainingToSelect--;
-          }
-        });
+      // Batch fetch multiple pages concurrently for better performance
+      const batchSize = 5; // Process 5 pages at a time
+      const pageBatches = [];
+      
+      for (let i = startPage + 1; i <= endPage; i += batchSize) {
+        const batchEnd = Math.min(i + batchSize - 1, endPage);
+        pageBatches.push({ start: i, end: batchEnd });
       }
 
+      // Process batches with progress updates
+      for (const batch of pageBatches) {
+        // Fetch batch of pages concurrently
+        const fetchPromises = [];
+        for (let page = batch.start; page <= batch.end; page++) {
+          fetchPromises.push(
+            fetch(`https://api.artic.edu/api/v1/artworks?page=${page}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`)
+              .then(response => response.json())
+              .catch(error => {
+                console.error(`Error fetching page ${page}:`, error);
+                return null;
+              })
+          );
+        }
+
+        // Wait for batch to complete
+        const batchResults = await Promise.all(fetchPromises);
+        
+                 // Process batch results
+         for (const result of batchResults) {
+           if (result && result.data) {
+             result.data.forEach((artwork: Artwork) => {
+               if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+                 newSelected.add(artwork.id);
+                 remainingToSelect--;
+               }
+             });
+             processedPages++;
+           }
+         }
+
+        // Update progress and allow UI to refresh
+        setSelectedArtworks(new Set(newSelected));
+        
+        // Update progress state
+        const progress = Math.round((processedPages / totalPagesToProcess) * 100);
+        setSelectionProgress(progress);
+        
+        // Show progress toast
+        toast.current?.show({
+          severity: 'info',
+          summary: 'Selection Progress',
+          detail: `${progress}% complete - ${newSelected.size} items selected`,
+          life: 1000
+        });
+
+        // Small delay to prevent UI blocking
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+
+      // Final update
       setSelectedArtworks(newSelected);
       updateSelectAll(newSelected);
 
       toast.current?.show({
         severity: 'success',
         summary: 'Selection Complete',
-        detail: `${newSelected.size} artworks selected`,
+        detail: `${newSelected.size} artworks selected across ${processedPages} pages`,
         life: 3000
       });
 
@@ -194,6 +248,8 @@ function App() {
       });
     } finally {
       setLoading(false);
+      setIsBulkSelecting(false);
+      setSelectionProgress(0);
     }
   };
 
@@ -262,6 +318,24 @@ function App() {
         {/* Selection Panel */}
         {selectedArtworks.size > 0 && selectionPanel()}
 
+        {/* Bulk Selection Progress */}
+        {isBulkSelecting && (
+          <div className="mb-4 p-3 border-round bg-blue-50">
+            <div className="flex align-items-center justify-content-between mb-2">
+              <span className="font-medium text-blue-800">Bulk Selection in Progress</span>
+              <span className="text-sm text-blue-600">{selectionProgress}%</span>
+            </div>
+            <ProgressBar 
+              value={selectionProgress} 
+              className="h-2"
+              color="blue"
+            />
+            <p className="text-xs text-blue-600 mt-1">
+              Processing pages... Please wait
+            </p>
+          </div>
+        )}
+
         {/* DataTable */}
         <div className="relative">
           {loading && (
@@ -296,12 +370,28 @@ function App() {
                 <p className="text-xs text-gray-500 mt-1">
                   Currently selected: {selectedArtworks.size} items
                 </p>
+                {parseInt(selectionCount) > 100 && (
+                  <p className="text-xs text-orange-600 mt-1">
+                    ⚠️ Large selections may take time to process
+                  </p>
+                )}
               </div>
-              <div className="flex justify-center">
+              <div className="flex flex-col gap-2">
                 <Button
                   label="Select Rows"
                   size="small"
                   onClick={handleSelectNRows}
+                  className="px-4 py-1"
+                  disabled={loading}
+                />
+                <Button
+                  label={`Select All (${totalRecords})`}
+                  size="small"
+                  severity="secondary"
+                  onClick={() => {
+                    setSelectionCount(totalRecords.toString());
+                    handleSelectNRows();
+                  }}
                   className="px-4 py-1"
                   disabled={loading}
                 />
