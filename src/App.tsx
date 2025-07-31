@@ -338,12 +338,7 @@ function App() {
     }
   };
 
-  // Progress tracking function
-  const updateProgress = (processedPages: number, totalPagesToProcess: number, newSelected: Set<number>) => {
-    const progress = Math.round((processedPages / totalPagesToProcess) * 100);
-    setSelectionProgress(progress);
-    setSelectedArtworks(new Set(newSelected));
-  };
+
 
   // Ultra-fast selection mode for any large selection
   const handleUltraFastSelection = async (count: number) => {
@@ -398,7 +393,7 @@ function App() {
           const batchResults = await Promise.allSettled(batchPromises);
           
           // Process results from this batch
-          batchResults.forEach((result, index) => {
+          batchResults.forEach((result) => {
             if (result.status === 'fulfilled' && result.value.data) {
               result.value.data.forEach((artwork: Artwork) => {
                 if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
@@ -502,7 +497,7 @@ function App() {
         const batchResults = await Promise.allSettled(batchPromises);
         
         // Process all results
-        batchResults.forEach((result, index) => {
+        batchResults.forEach((result) => {
           if (result.status === 'fulfilled' && result.value.data) {
             result.value.data.forEach((artwork: Artwork) => {
               if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
