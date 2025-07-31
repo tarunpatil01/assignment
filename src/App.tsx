@@ -47,6 +47,7 @@ function App() {
   const [selectionCount, setSelectionCount] = useState('');
   const [selectionProgress, setSelectionProgress] = useState(0);
   const [isBulkSelecting, setIsBulkSelecting] = useState(false);
+  const [viewingSelected, setViewingSelected] = useState(false);
   const toast = useRef<Toast>(null);
 
   // Performance optimization: Request cache to avoid re-fetching
@@ -170,7 +171,15 @@ function App() {
   // Handle page change
   const onPageChange = (event: { first: number; rows: number; page: number }) => {
     const newPage = event.page + 1;
-    fetchArtworks(newPage);
+    setCurrentPage(newPage);
+    
+    // If we have selections and are viewing selected items, show selected artworks for this page
+    if (selectedArtworks.size > 0 && viewingSelected) {
+      fetchSelectedArtworksForPage(newPage);
+    } else {
+      // Otherwise fetch regular page data
+      fetchArtworks(newPage);
+    }
   };
 
   // Update select all state based on current selections
@@ -225,7 +234,18 @@ function App() {
     setIsBulkSelecting(true);
     setSelectionProgress(0);
     
-    // Try ultra-fast selection first for very large numbers
+    // Try ultra-fast bulk ID selection for very large numbers (>500)
+    const bulkIdResult = await handleBulkIdSelection(count);
+    if (bulkIdResult) {
+      setLoading(false);
+      setIsBulkSelecting(false);
+      setSelectionProgress(0);
+      setShowSelectionWindow(false);
+      setSelectionCount('');
+      return;
+    }
+    
+    // Try ultra-fast selection for large numbers (>100)
     const ultraFastResult = await handleUltraFastSelection(count);
     if (ultraFastResult) {
       setLoading(false);
@@ -236,112 +256,70 @@ function App() {
       return;
     }
     
-    const newSelected = new Set(selectedArtworks);
-    let remainingToSelect = count - selectedArtworks.size;
-    let processedPages = 0;
-    const totalPagesToProcess = endPage - startPage + 1;
-
-    // Performance optimization: Use larger batch size for better throughput
-    const batchSize = Math.min(10, Math.ceil((endPage - startPage) / 4)); // Adaptive batch size
-    const pageBatches = [];
-    
-    for (let i = startPage + 1; i <= endPage; i += batchSize) {
-      const batchEnd = Math.min(i + batchSize - 1, endPage);
-      pageBatches.push({ start: i, end: batchEnd });
+    // Try hybrid selection for medium numbers (50-100)
+    const hybridResult = await handleHybridSelection(count);
+    if (hybridResult) {
+      setLoading(false);
+      setIsBulkSelecting(false);
+      setSelectionProgress(0);
+      setShowSelectionWindow(false);
+      setSelectionCount('');
+      return;
     }
 
+
+
+
+    
+    // For small selections (1-50 items), use traditional approach
+    const newSelected = new Set(selectedArtworks);
+    let remainingToSelect = count - selectedArtworks.size;
+    
     try {
-      // First, select all items on current page that aren't already selected
+      // Select from current page first
       artworks.forEach(artwork => {
         if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
           newSelected.add(artwork.id);
           remainingToSelect--;
         }
       });
-      processedPages++;
-
-      // Advanced optimization: Process all batches concurrently with connection pooling
-      const allFetchPromises = [];
-      const batchMap = new Map(); // Track which batch each promise belongs to
-
-      // Create all fetch promises upfront for maximum concurrency
-      for (let batchIndex = 0; batchIndex < pageBatches.length; batchIndex++) {
-        const batch = pageBatches[batchIndex];
-        for (let page = batch.start; page <= batch.end; page++) {
-          const url = `https://api.artic.edu/api/v1/artworks?page=${page}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`;
-          const promise = fetchWithCache(url)
-            .then(data => ({ page, data, batchIndex }))
-            .catch(error => {
-              console.error(`Error fetching page ${page}:`, error);
-              return { page, data: null, batchIndex };
-            });
-          
-          allFetchPromises.push(promise);
-          batchMap.set(promise, batchIndex);
-        }
-      }
-
-      // Process results as they complete (streaming approach)
-      const completedBatches = new Set();
-      const batchResults = new Map(); // batchIndex -> results[]
-
-      // Use Promise.allSettled for better error handling and speed
-      const results = await Promise.allSettled(allFetchPromises);
       
-      // Process completed results efficiently
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value.data) {
-          const { page, data, batchIndex } = result.value;
-          
-          if (!batchResults.has(batchIndex)) {
-            batchResults.set(batchIndex, []);
-          }
-          batchResults.get(batchIndex).push(data);
-          
-          // Process data immediately for better responsiveness
-          data.data.forEach((artwork: Artwork) => {
-            if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
-              newSelected.add(artwork.id);
-              remainingToSelect--;
-            }
-          });
-          
-          processedPages++;
-          
-          // Update progress more frequently for better UX
-          if (processedPages % 3 === 0) {
-            const progress = Math.round((processedPages / totalPagesToProcess) * 100);
-            setSelectionProgress(progress);
-            setSelectedArtworks(new Set(newSelected));
+      // If we need more items, fetch additional pages (only for small selections)
+      if (remainingToSelect > 0) {
+        const pagesToFetch = Math.ceil(remainingToSelect / rowsPerPage);
+        const maxPagesToFetch = Math.min(pagesToFetch, 3); // Limit to 3 pages for small selections
+        
+        for (let page = currentPage + 1; page <= currentPage + maxPagesToFetch && remainingToSelect > 0; page++) {
+          try {
+            const url = `https://api.artic.edu/api/v1/artworks?page=${page}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`;
+            const data = await fetchWithCache(url);
             
-            // Allow UI to refresh
-            await new Promise(resolve => setTimeout(resolve, 10));
+            data.data.forEach((artwork: Artwork) => {
+              if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+                newSelected.add(artwork.id);
+                remainingToSelect--;
+              }
+            });
+          } catch (error) {
+            console.error(`Error fetching page ${page}:`, error);
+            break;
           }
         }
       }
-
-      // Final update
+      
       setSelectedArtworks(newSelected);
       updateSelectAll(newSelected);
 
       const totalTime = performance.now() - startTime;
-      const avgTimePerPage = totalTime / processedPages;
       
       toast.current?.show({
         severity: 'success',
         summary: 'Selection Complete',
-        detail: `${newSelected.size} artworks selected across ${processedPages} pages in ${Math.round(totalTime)}ms (${Math.round(avgTimePerPage)}ms/page)`,
+        detail: `${newSelected.size} artworks selected in ${Math.round(totalTime)}ms`,
         life: 3000
       });
       
-      logPerformance(`Total selection operation`, totalTime);
-      console.log(`📊 Performance Summary:`, {
-        totalTime: Math.round(totalTime),
-        avgTimePerPage: Math.round(avgTimePerPage),
-        cacheHits: performanceMetrics.current.cacheHits,
-        cacheMisses: performanceMetrics.current.cacheMisses,
-        cacheHitRate: Math.round((performanceMetrics.current.cacheHits / (performanceMetrics.current.cacheHits + performanceMetrics.current.cacheMisses)) * 100) + '%'
-      });
+      logPerformance(`Small selection operation`, totalTime);
 
       setShowSelectionWindow(false);
       setSelectionCount('');
@@ -360,31 +338,342 @@ function App() {
     }
   };
 
-  // Ultra-fast selection mode for very large selections
+  // Progress tracking function
+  const updateProgress = (processedPages: number, totalPagesToProcess: number, newSelected: Set<number>) => {
+    const progress = Math.round((processedPages / totalPagesToProcess) * 100);
+    setSelectionProgress(progress);
+    setSelectedArtworks(new Set(newSelected));
+  };
+
+  // Ultra-fast selection mode for any large selection
   const handleUltraFastSelection = async (count: number) => {
-    if (count > 5000) {
-      // For very large selections, use mathematical approach
-      const startId = 1; // Assuming IDs start from 1
-      const endId = Math.min(startId + count - 1, totalRecords);
+    // Use mathematical approach for any selection > 100 items
+    if (count > 100) {
+      const startTime = performance.now();
       
-      const newSelected = new Set<number>();
-      for (let id = startId; id <= endId; id++) {
-        newSelected.add(id);
+      const newSelected = new Set(selectedArtworks);
+      let remainingToSelect = count - selectedArtworks.size;
+      
+      // First, select all items from current page
+      let selectedFromCurrentPage = 0;
+      artworks.forEach(artwork => {
+        if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+          newSelected.add(artwork.id);
+          remainingToSelect--;
+          selectedFromCurrentPage++;
+        }
+      });
+      
+      // Calculate all needed page numbers for parallel fetching
+      const neededPages = [];
+      let pageToFetch = currentPage;
+      const maxPages = Math.ceil(totalRecords / rowsPerPage);
+      
+      // Calculate how many pages we need to fetch based on remaining items
+      const pagesNeeded = Math.ceil(remainingToSelect / rowsPerPage);
+      for (let i = 1; i <= pagesNeeded && pageToFetch + i <= maxPages; i++) {
+        neededPages.push(pageToFetch + i);
+      }
+      
+      if (neededPages.length > 0) {
+        setSelectionProgress(10); // Initial progress after current page
+        
+        // Fire all requests in parallel with batching for better performance
+        const batchSize = 10; // Process 10 pages at a time to avoid overwhelming the API
+        const batches = [];
+        
+        for (let i = 0; i < neededPages.length; i += batchSize) {
+          batches.push(neededPages.slice(i, i + batchSize));
+        }
+        
+        let processedPages = 0;
+        const totalPagesToProcess = neededPages.length;
+        
+        for (const batch of batches) {
+          // Fetch this batch in parallel
+          const batchPromises = batch.map(page =>
+            fetchWithCache(`https://api.artic.edu/api/v1/artworks?page=${page}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`)
+          );
+          
+          const batchResults = await Promise.allSettled(batchPromises);
+          
+          // Process results from this batch
+          batchResults.forEach((result, index) => {
+            if (result.status === 'fulfilled' && result.value.data) {
+              result.value.data.forEach((artwork: Artwork) => {
+                if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+                  newSelected.add(artwork.id);
+                  remainingToSelect--;
+                }
+              });
+            }
+            processedPages++;
+          });
+          
+          // Stop if we've reached our target
+          if (remainingToSelect <= 0) {
+            break;
+          }
+          
+          // Update progress after each batch
+          const progress = Math.round(((processedPages / totalPagesToProcess) * 80) + 10); // 10-90% range
+          setSelectionProgress(progress);
+          setSelectedArtworks(new Set(newSelected));
+          
+          // Small delay to allow UI to update
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
       }
       
       setSelectedArtworks(newSelected);
       setSelectionProgress(100);
+      setViewingSelected(true); // Switch to viewing selected items
+      
+      // Fetch actual artwork data for the first few selected items to display in current page
+      const currentPageIds = Array.from(newSelected).slice(0, rowsPerPage);
+      if (currentPageIds.length > 0) {
+        try {
+          // Fetch data for the first page of selected items
+          const url = `https://api.artic.edu/api/v1/artworks?ids=${currentPageIds.join(',')}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`;
+          const data = await fetchWithCache(url);
+          
+          // Update current page with selected artworks
+          if (data.data && data.data.length > 0) {
+            setArtworks(data.data);
+          }
+        } catch (error) {
+          console.error('Error fetching selected artwork data:', error);
+        }
+      }
+      
+      const totalTime = performance.now() - startTime;
       
       toast.current?.show({
         severity: 'success',
         summary: 'Ultra-Fast Selection Complete',
-        detail: `${newSelected.size} artworks selected using mathematical approach`,
+        detail: `${newSelected.size} artworks selected in ${Math.round(totalTime)}ms using parallel approach`,
         life: 3000
       });
+      
+      logPerformance(`Ultra-fast selection of ${count} items`, totalTime);
       
       return true;
     }
     return false;
+  };
+
+  // Hybrid selection for medium-sized selections (50-100 items)
+  const handleHybridSelection = async (count: number) => {
+    if (count > 50 && count <= 100) {
+      const startTime = performance.now();
+      
+      const newSelected = new Set(selectedArtworks);
+      let remainingToSelect = count - selectedArtworks.size;
+      
+      // First, select from current page
+      let selectedFromCurrentPage = 0;
+      artworks.forEach(artwork => {
+        if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+          newSelected.add(artwork.id);
+          remainingToSelect--;
+          selectedFromCurrentPage++;
+        }
+      });
+      
+      // Calculate all needed page numbers for parallel fetching
+      const neededPages = [];
+      let pageToFetch = currentPage;
+      const maxPages = Math.ceil(totalRecords / rowsPerPage);
+      
+      // Calculate how many pages we need to fetch
+      const pagesNeeded = Math.ceil(remainingToSelect / rowsPerPage);
+      for (let i = 1; i <= pagesNeeded && pageToFetch + i <= maxPages; i++) {
+        neededPages.push(pageToFetch + i);
+      }
+      
+      if (neededPages.length > 0) {
+        setSelectionProgress(10); // Initial progress after current page
+        
+        // Fire all requests in parallel
+        const batchPromises = neededPages.map(page =>
+          fetchWithCache(`https://api.artic.edu/api/v1/artworks?page=${page}&limit=${rowsPerPage}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`)
+        );
+        
+        const batchResults = await Promise.allSettled(batchPromises);
+        
+        // Process all results
+        batchResults.forEach((result, index) => {
+          if (result.status === 'fulfilled' && result.value.data) {
+            result.value.data.forEach((artwork: Artwork) => {
+              if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+                newSelected.add(artwork.id);
+                remainingToSelect--;
+              }
+            });
+          }
+        });
+        
+        setSelectionProgress(100);
+      }
+      
+      setSelectedArtworks(newSelected);
+      setViewingSelected(true); // Switch to viewing selected items
+      
+      // Fetch actual artwork data for display
+      const selectedIds = Array.from(newSelected).slice(0, rowsPerPage);
+      if (selectedIds.length > 0) {
+        try {
+          const url = `https://api.artic.edu/api/v1/artworks?ids=${selectedIds.join(',')}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`;
+          const data = await fetchWithCache(url);
+          
+          if (data.data && data.data.length > 0) {
+            setArtworks(data.data);
+          }
+        } catch (error) {
+          console.error('Error fetching selected artwork data:', error);
+        }
+      }
+      
+      const totalTime = performance.now() - startTime;
+      
+      toast.current?.show({
+        severity: 'success',
+        summary: 'Hybrid Selection Complete',
+        detail: `${newSelected.size} artworks selected in ${Math.round(totalTime)}ms using parallel approach`,
+        life: 3000
+      });
+      
+      logPerformance(`Hybrid selection of ${count} items`, totalTime);
+      
+      return true;
+    }
+    return false;
+  };
+
+  // Ultra-fast bulk selection using ID collection and bulk fetching
+  const handleBulkIdSelection = async (count: number) => {
+    if (count > 500) { // Use this method for very large selections
+      const startTime = performance.now();
+      
+      const newSelected = new Set(selectedArtworks);
+      let remainingToSelect = count - selectedArtworks.size;
+      
+      // First, select all items from current page
+      let selectedFromCurrentPage = 0;
+      artworks.forEach(artwork => {
+        if (!newSelected.has(artwork.id) && remainingToSelect > 0) {
+          newSelected.add(artwork.id);
+          remainingToSelect--;
+          selectedFromCurrentPage++;
+        }
+      });
+      
+      setSelectionProgress(10);
+      
+      // Calculate all needed page numbers
+      const neededPages = [];
+      let pageToFetch = currentPage;
+      const maxPages = Math.ceil(totalRecords / rowsPerPage);
+      
+      // Calculate how many pages we need to fetch
+      const pagesNeeded = Math.ceil(remainingToSelect / rowsPerPage);
+      for (let i = 1; i <= pagesNeeded && pageToFetch + i <= maxPages; i++) {
+        neededPages.push(pageToFetch + i);
+      }
+      
+      if (neededPages.length > 0) {
+        // Step 1: Collect all IDs from needed pages in parallel
+        setSelectionProgress(20);
+        
+        const idCollectionPromises = neededPages.map(page =>
+          fetchWithCache(`https://api.artic.edu/api/v1/artworks?page=${page}&limit=${rowsPerPage}&fields=id`)
+        );
+        
+        const idResults = await Promise.allSettled(idCollectionPromises);
+        
+        // Collect all IDs
+        const allIds: number[] = [];
+        idResults.forEach(result => {
+          if (result.status === 'fulfilled' && result.value.data) {
+            result.value.data.forEach((artwork: { id: number }) => {
+              allIds.push(artwork.id);
+            });
+          }
+        });
+        
+        setSelectionProgress(50);
+        
+        // Step 2: Add IDs to selection until we reach the target count
+        for (const id of allIds) {
+          if (!newSelected.has(id) && remainingToSelect > 0) {
+            newSelected.add(id);
+            remainingToSelect--;
+          }
+        }
+        
+        setSelectionProgress(80);
+        
+        // Step 3: Fetch full data for the first page of selected items using bulk endpoint
+        const currentPageIds = Array.from(newSelected).slice(0, rowsPerPage);
+        if (currentPageIds.length > 0) {
+          try {
+            const url = `https://api.artic.edu/api/v1/artworks?ids=${currentPageIds.join(',')}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`;
+            const data = await fetchWithCache(url);
+            
+            if (data.data && data.data.length > 0) {
+              setArtworks(data.data);
+            }
+          } catch (error) {
+            console.error('Error fetching selected artwork data:', error);
+          }
+        }
+      }
+      
+      setSelectedArtworks(newSelected);
+      setSelectionProgress(100);
+      setViewingSelected(true);
+      
+      const totalTime = performance.now() - startTime;
+      
+      toast.current?.show({
+        severity: 'success',
+        summary: 'Bulk Selection Complete',
+        detail: `${newSelected.size} artworks selected in ${Math.round(totalTime)}ms using bulk ID approach`,
+        life: 3000
+      });
+      
+      logPerformance(`Bulk ID selection of ${count} items`, totalTime);
+      
+      return true;
+    }
+    return false;
+  };
+
+  // Fetch and display selected artworks for current page
+  const fetchSelectedArtworksForPage = async (page: number) => {
+    if (selectedArtworks.size === 0) return;
+    
+    const startIndex = (page - 1) * rowsPerPage;
+    const endIndex = startIndex + rowsPerPage;
+    const pageSelectedIds = Array.from(selectedArtworks).slice(startIndex, endIndex);
+    
+    if (pageSelectedIds.length > 0) {
+      try {
+        const url = `https://api.artic.edu/api/v1/artworks?ids=${pageSelectedIds.join(',')}&fields=id,title,place_of_origin,artist_display,inscriptions,date_start,date_end`;
+        const data = await fetchWithCache(url);
+        
+        if (data.data && data.data.length > 0) {
+          setArtworks(data.data);
+        } else {
+          setArtworks([]); // No data for this page
+        }
+      } catch (error) {
+        console.error('Error fetching selected artwork data for page:', error);
+        setArtworks([]); // Set empty array on error
+      }
+    } else {
+      setArtworks([]); // No selected items for this page
+    }
   };
 
   // Performance monitoring
@@ -415,6 +704,24 @@ function App() {
           <span className="font-medium">
             {selectedCount} of {totalCount} artworks selected
           </span>
+          {selectedCount > 0 && (
+            <Button
+              label={viewingSelected ? "View All" : "View Selected"}
+              icon={viewingSelected ? "pi pi-list" : "pi pi-check-square"}
+              size="small"
+              severity={viewingSelected ? "secondary" : "info"}
+              onClick={() => {
+                setViewingSelected(!viewingSelected);
+                if (!viewingSelected) {
+                  // Switch to viewing selected items
+                  fetchSelectedArtworksForPage(currentPage);
+                } else {
+                  // Switch back to viewing all items
+                  fetchArtworks(currentPage);
+                }
+              }}
+            />
+          )}
         </div>
         {selectedCount > 0 && (
           <Button
@@ -424,6 +731,7 @@ function App() {
             severity="secondary"
             onClick={() => {
               setSelectedArtworks(new Set());
+              setViewingSelected(false);
             }}
           />
         )}
@@ -518,9 +826,19 @@ function App() {
                 <p className="text-xs text-gray-500 mt-1">
                   Currently selected: {selectedArtworks.size} items
                 </p>
-                {parseInt(selectionCount) > 100 && (
+                {parseInt(selectionCount) > 500 && (
+                  <p className="text-xs text-green-600 mt-1">
+                    🚀 Will use ultra-fast bulk ID approach
+                  </p>
+                )}
+                {parseInt(selectionCount) > 100 && parseInt(selectionCount) <= 500 && (
+                  <p className="text-xs text-blue-600 mt-1">
+                    ⚡ Will use parallel batch approach
+                  </p>
+                )}
+                {parseInt(selectionCount) > 50 && parseInt(selectionCount) <= 100 && (
                   <p className="text-xs text-orange-600 mt-1">
-                    ⚠️ Large selections may take time to process
+                    ⚡ Will use parallel approach
                   </p>
                 )}
               </div>
@@ -543,18 +861,7 @@ function App() {
                   className="px-4 py-1"
                   disabled={loading}
                 />
-                <Button
-                  label="Ultra-Fast Mode"
-                  size="small"
-                  severity="success"
-                  onClick={() => {
-                    setSelectionCount('5000');
-                    handleSelectNRows();
-                  }}
-                  className="px-4 py-1"
-                  disabled={loading}
-                  tooltip="Use mathematical approach for very large selections"
-                />
+
               </div>
             </div>
           )}
@@ -660,10 +967,13 @@ function App() {
           <Paginator
             first={(currentPage - 1) * rowsPerPage}
             rows={rowsPerPage}
-            totalRecords={totalRecords}
+            totalRecords={viewingSelected ? selectedArtworks.size : totalRecords}
             onPageChange={onPageChange}
             template="FirstPageLink PrevPageLink PageLinks NextPageLink LastPageLink CurrentPageReport RowsPerPageDropdown"
-            currentPageReportTemplate="Showing {first} to {last} of {totalRecords} artworks"
+            currentPageReportTemplate={viewingSelected ? 
+              `Showing {first} to {last} of ${selectedArtworks.size} selected artworks` : 
+              "Showing {first} to {last} of {totalRecords} artworks"
+            }
             rowsPerPageOptions={[12, 24, 48]}
           />
         </div>
